@@ -4,3 +4,6 @@ android/*.apk
 android/*.idsig
 *.keystore
 *.p12
+godot/.godot/
+build/
+*.import.tmp
