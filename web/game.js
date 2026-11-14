@@ -43,7 +43,7 @@ const cv = $('cv');
 const MOBILE = matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad/i.test(navigator.userAgent);
 const CRASHES = (() => { try { return parseInt(localStorage.getItem('secondhand3d-gpucrash') || '0', 10) || 0; } catch (e) { return 0; } })();
 let renderer;
-try { renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: !QS.has('noaa') && !MOBILE, powerPreference: 'default', stencil: false }); }
+try { renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: !QS.has('noaa'), powerPreference: 'high-performance', stencil: false }); }
 catch (e) {
   try { renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: false, powerPreference: 'low-power', stencil: false, depth: true }); }
   catch (e2) {
@@ -308,10 +308,10 @@ const sky = new THREE.Mesh(new THREE.SphereGeometry(200, 32, 16), new THREE.Shad
 sky.frustumCulled = false; sky.renderOrder = -10; scene.add(sky);
 
 // ---------------------------------------------------------------- resolution + adaptive quality
-const QL = [{ pr: 0.75, sh: 0 }, { pr: 1.0, sh: 1024 }, { pr: 1.25, sh: 1024 }, { pr: 1.5, sh: 1024 }, { pr: 1.75, sh: 2048 }, { pr: 2.0, sh: 2048 }];
+const QL = [{ pr: 0.75, sh: 0 }, { pr: 1.0, sh: 1024 }, { pr: 1.25, sh: 1024 }, { pr: 1.5, sh: 2048 }, { pr: 1.75, sh: 2048 }, { pr: 2.0, sh: 2048 }];
 const DPR = window.devicePixelRatio || 1;
-let qMax = MOBILE ? 3 : DPR >= 2 ? 4 : DPR >= 1.5 ? 3 : 2;
-let qLevel = MOBILE ? 1 : Math.min(qMax, 3);
+let qMax = DPR >= 2 ? 4 : DPR >= 1.5 ? 3 : 2;
+let qLevel = Math.min(qMax, 3);
 if (CRASHES > 0) { qMax = Math.max(0, qMax - CRASHES); qLevel = Math.max(0, Math.min(qLevel, qMax) - CRASHES); }
 const qLock = QS.has('q') ? clamp(parseInt(QS.get('q'), 10) || 0, 0, QL.length - 1) : -1;
 if (qLock >= 0) { qLevel = qLock; qMax = qLock; }
