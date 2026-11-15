@@ -128,16 +128,23 @@ func PREV() -> String:
 	return META.endName if (META.ended and META.endName != "") else "Wren"
 
 # ---------------------------------------------------------------- setup
+const Diag := preload("res://scripts/diag.gd")
+
 func _ready() -> void:
+	Diag.start()
+	# nothing 3D is drawn until a world is loaded: the menus must never depend on the 3D renderer
+	get_viewport().disable_3d = true
 	randomize()
 	get_tree().auto_accept_quit = true
 	get_tree().quit_on_go_back = false
 	var m = read_json(META_PATH)
-	META = {"ended": false, "endName": "", "endMins": 0, "endDeaths": 0, "slot1Taps": 0, "muted": false, "sens": 1.0, "inv": false, "gfx": "auto"}
+	META = {"ended": false, "endName": "", "endMins": 0, "endDeaths": 0, "slot1Taps": 0, "muted": false, "sens": 1.0, "inv": false, "gfx": "auto", "safe": false}
 	if m is Dictionary:
 		META.merge(m, true)
 	SAVED = read_json(SAVE_PATH)
 	boot_check()
+	Diag.note("renderer %s / %s | GPU %s %s | %s" % [RenderingServer.get_current_rendering_method(), RenderingServer.get_current_rendering_driver_name(), RenderingServer.get_video_adapter_vendor(), RenderingServer.get_video_adapter_name(), RenderingServer.get_video_adapter_api_version()])
+	Diag.note("screen %s dpi %d window %s safe %s orient %d | previous unfinished boots: %d | safe graphics: %s" % [str(DisplayServer.screen_get_size()), DisplayServer.screen_get_dpi(), str(DisplayServer.window_get_size()), str(DisplayServer.get_display_safe_area()), DisplayServer.screen_get_orientation(), crashes, str(META.get("safe", false))])
 	sfx = Sfx.new()
 	add_child(sfx)
 	sfx.set_mute(bool(META.muted))
@@ -149,22 +156,41 @@ func _ready() -> void:
 	get_viewport().size_changed.connect(on_resize)
 	on_resize()
 	layout_ui()
+	if auto_safe:
+		later(1.0, func() -> void: ui.toast("The last starts didn't finish, so Safe graphics is on.\nYou can switch it off on the file screen.", 6.0))
 	W = World.new()
+	var gles := str(RenderingServer.get_current_rendering_method()) == "gl_compatibility"
+	var args := OS.get_cmdline_user_args()
+	W.rigid_people = true   # rigid body parts everywhere: no GPU skinning path at all (transform feedback on GLES3, compute on Vulkan)
+	W.split_mm = OS.has_feature("mobile") or args.has("rigid")
 	if OS.get_cmdline_user_args().size() > 0:
 		test_hook.call_deferred(OS.get_cmdline_user_args())
 
 # a run that never reached "ok" counts as a graphics crash and steps quality down next time
 var crashes := 0
+var auto_safe := false
 func boot_check() -> void:
 	var cf := ConfigFile.new()
 	if cf.load(BOOT_PATH) == OK:
 		crashes = int(cf.get_value("boot", "crashes", 0))
 		if bool(cf.get_value("boot", "running", false)):
 			crashes += 1
+	if crashes >= 2 and not bool(META.get("safe", false)):
+		# two starts in a row never got going: switch to safe graphics automatically
+		META.safe = true
+		auto_safe = true
+		write_json(META_PATH, META)
 	cf.set_value("boot", "crashes", crashes)
 	cf.set_value("boot", "running", true)
 	cf.save(BOOT_PATH)
-	later(20.0, boot_ok)
+	later(15.0, boot_ok)
+
+func mark_running() -> void:
+	var cf := ConfigFile.new()
+	cf.set_value("boot", "crashes", crashes)
+	cf.set_value("boot", "running", true)
+	cf.save(BOOT_PATH)
+	later(15.0, boot_ok)
 
 func boot_ok() -> void:
 	var cf := ConfigFile.new()
@@ -204,7 +230,9 @@ func setup_scene() -> void:
 	sky_mat.shader = load("res://shaders/sky.gdshader")
 	sky.sky_material = sky_mat
 	sky.radiance_size = Sky.RADIANCE_SIZE_32
-	sky.process_mode = Sky.PROCESS_MODE_REALTIME
+	# nothing reads the sky's radiance (ambient is a flat colour, reflections are off), so never
+	# re-filter it every frame; on Vulkan "realtime" would also force a 256px radiance map
+	sky.process_mode = Sky.PROCESS_MODE_INCREMENTAL
 	env.sky = sky
 	var we := WorldEnvironment.new()
 	we.environment = env
@@ -229,18 +257,23 @@ func setup_scene() -> void:
 	world_root.add_child(lantern)
 
 # ---------------------------------------------------------------- quality (adaptive, like the browser build)
-const QL := [[0.55, 0], [0.65, 1024], [0.75, 1024], [0.85, 2048], [1.0, 2048]]
-var q_level := 2
+# [3D resolution scale, sun shadow map size]. No MSAA on phones: on Android GLES3, MSAA + a 3D scale
+# below 1.0 leaks driver memory every frame, and several mobile drivers render MSAA black.
+const QL := [[0.6, 0], [0.7, 0], [0.75, 1024], [0.85, 1024], [1.0, 2048]]
+var q_level := 1
 var q_max := 4
 var q_acc := 0.0
 var q_n := 0
 var q_cool := 2.0
 var q_good := 0
 
+func is_mobile() -> bool:
+	return OS.has_feature("mobile") or (ui != null and ui.force_mobile)
+
 func init_quality() -> void:
-	var mobile := OS.has_feature("mobile")
+	var mobile := is_mobile()
 	q_max = 3 if mobile else 4
-	q_level = 2 if mobile else 3
+	q_level = 1 if mobile else 3
 	if crashes > 0:
 		q_max = maxi(0, q_max - crashes)
 		q_level = maxi(0, mini(q_level, q_max) - crashes)
@@ -254,16 +287,42 @@ func apply_quality() -> void:
 	if not q_inited:
 		q_inited = true
 		init_quality()
+	q_level = clampi(q_level, 0, QL.size() - 1)
+	var vp := get_viewport()
+	var safe: bool = META.get("safe", false)
 	var q: Array = QL[q_level]
-	get_viewport().scaling_3d_scale = q[0]
-	var want: bool = q[1] > 0
-	sun.shadow_enabled = want
-	if want:
-		RenderingServer.directional_shadow_atlas_set_size(q[1], true)
-	get_viewport().msaa_3d = Viewport.MSAA_2X if q_level >= 2 else Viewport.MSAA_DISABLED
+	var sc: float = clampf(float(q[0]), 0.5, 1.0)
+	var shadow: int = int(q[1])
+	if safe:
+		# safe graphics: plain full-res render straight to the screen, no shadows, no MSAA,
+		# no screen-texture effects, no sky shader
+		sc = 1.0
+		shadow = 0
+	vp.scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	vp.scaling_3d_scale = sc
+	vp.msaa_3d = Viewport.MSAA_2X if (q_level >= 3 and not is_mobile() and not safe) else Viewport.MSAA_DISABLED
+	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+	vp.use_debanding = false
+	sun.shadow_enabled = shadow > 0
+	if shadow > 0:
+		RenderingServer.directional_shadow_atlas_set_size(shadow, true)
+	if sky_mat and area != null:
+		apply_light()
+	Diag.note("quality " + quality_text())
+
+func quality_text() -> String:
+	var vp := get_viewport()
+	return "q%d/%d scale %.2f msaa %d shadows %s%s crashes %d" % [q_level, q_max, vp.scaling_3d_scale, vp.msaa_3d, str(sun.shadow_enabled), " SAFE" if META.get("safe", false) else "", crashes]
+
+func toggle_safe() -> void:
+	META.safe = not bool(META.get("safe", false))
+	save_meta()
+	apply_quality()
+	ui.sync_safe()
+	ui.toast("Safe graphics " + ("on" if META.safe else "off"))
 
 func quality_tick(raw: float) -> void:
-	if mode != "play" or raw > 0.25:
+	if mode != "play" or raw > 0.25 or META.get("safe", false):
 		return
 	q_cool -= raw
 	q_acc += raw
@@ -291,7 +350,7 @@ func quality_tick(raw: float) -> void:
 		q_good = 0
 
 func on_resize() -> void:
-	var sz := DisplayServer.window_get_size()
+	var sz := Vector2i(ui.win_size()) if ui else DisplayServer.window_get_size()
 	cam.fov = 76.0 if sz.x < sz.y else 60.0
 	if ui:
 		ui.on_resize()
@@ -1226,7 +1285,7 @@ func apply_light() -> void:
 	env.fog_light_color = bgc
 	env.fog_depth_end = f1 * (1.25 if L == "day" else 1.1)
 	env.fog_depth_curve = 1.5
-	if L == "day":
+	if L == "day" and not META.get("safe", false):
 		env.background_mode = Environment.BG_SKY
 		sky_mat.set_shader_parameter("hor", bgc)
 		sky_mat.set_shader_parameter("top", hx(top))
@@ -1244,7 +1303,9 @@ func apply_light() -> void:
 	RenderingServer.global_shader_parameter_set("hemi_sky", Vector3(hs.r, hs.g, hs.b) * k)
 	RenderingServer.global_shader_parameter_set("hemi_ground", Vector3(hg.r, hg.g, hg.b) * k)
 	sun.light_color = hx(sC)
-	sun.light_energy = sI / PI * LIGHT_K
+	# Compatibility adds a shadow-casting light in sRGB space, which reads brighter than the linear
+	# blend Mobile/Vulkan does; lift the sun there so both builds look alike
+	sun.light_energy = sI / PI * LIGHT_K * (SUN_LIN_BOOST if (not gles_renderer and sun.shadow_enabled) else 1.0)
 	sun.basis = Basis.looking_at(-sd, Vector3.UP if absf(sd.y) < 0.99 else Vector3.FORWARD)
 	lantern.light_energy = lan / PI * LIGHT_K
 	lantern.light_color = hx(lanC)
@@ -1254,6 +1315,8 @@ func apply_light() -> void:
 			area[wk].material_override.set_shader_parameter("fogc", bgc)
 
 const LIGHT_K := 1.0
+const SUN_LIN_BOOST := 2.4
+var gles_renderer := str(RenderingServer.get_current_rendering_method()) == "gl_compatibility"
 var post_bg := Color(0, 0, 0)
 
 func bend_for() -> float:
@@ -2509,6 +2572,7 @@ func show_files() -> void:
 		s2 = "2  NEW FILE"
 		s2s = "NEXT PLAYER" if META.ended else "EMPTY"
 	ui.set_files(s1, s1s, s2, s2s)
+	ui.sync_safe()
 	ui.show_panel("files")
 	layout_ui()
 	sfx.set_song("title", 1.4 if META.ended else 0.0)
@@ -2577,17 +2641,21 @@ func on_pause_button(id: String) -> void:
 		"gfx":
 			META.gfx = "low" if META.get("gfx", "auto") == "auto" else "auto"
 			save_meta()
-			q_max = 1 if META.gfx == "low" else (3 if OS.has_feature("mobile") else 4)
+			q_max = 1 if META.gfx == "low" else (3 if is_mobile() else 4)
 			q_level = mini(q_level, q_max)
 			if META.gfx == "auto":
-				q_level = mini(2, q_max)
+				q_level = mini(1 if is_mobile() else 3, q_max)
 			apply_quality()
+		"safe":
+			toggle_safe()
 		"quit":
 			save()
 			show_files()
 	ui.sync_pause()
 
 func start_game(fresh: bool) -> void:
+	Diag.note("start_game fresh=%s" % str(fresh))
+	mark_running()
 	build_world()
 	ui.show_panel("")
 	mode = "play"
@@ -2729,11 +2797,21 @@ func step(dt: float) -> void:
 	if S != null:
 		ui.hud(int(S.hp), int(S.maxHearts), int(S.keys), int(S.pieces))
 
+var select_hold := 0.0
 func _process(delta: float) -> void:
 	var raw := delta
 	var dt := clampf(delta, 0.001, 0.05)
 	now += dt
 	poll_input()
+	# hold SELECT for a second: diagnostics overlay
+	if held.select:
+		select_hold += raw
+		if select_hold >= 1.0 and select_hold - raw < 1.0:
+			if mode == "map":
+				close_map()
+			ui.diag.toggle()
+	else:
+		select_hold = 0.0
 	if mode == "play" and dlg == null and not switching:
 		if pressed.start:
 			open_pause()
@@ -2797,12 +2875,29 @@ func sh_back() -> int:
 func test_hook(args: PackedStringArray) -> void:
 	var cmd := args[0]
 	var out := args[1] if args.size() > 1 else "/tmp/shot"
+	if args.has("cut"):
+		ui.fake_cut = 140.0
+	if args.has("safe") or args.has("noshadow"):
+		META.safe = args.has("safe")
+		if args.has("noshadow"):
+			q_level = 1
+		apply_quality()
+	if args.has("phone"):
+		ui.force_mobile = true
+		on_resize()
 	if cmd == "menus":
 		var sn := func(n: String) -> void:
 			await RenderingServer.frame_post_draw
 			get_viewport().get_texture().get_image().save_png(out + "_" + n + ".png")
 		await wait(0.5)
 		await sn.call("cart")
+		if args.has("rot"):
+			# simulate the phone rotating / leaving immersive mode after boot
+			var ws := get_window().size
+			get_window().size = Vector2i(ws.y, ws.x)
+			await wait(0.6)
+			print("ROT win=", get_window().size, " cs=", get_window().content_scale_size, " vs=", ui.vsize())
+			await sn.call("cart_rot")
 		on_insert()
 		await wait(0.3)
 		await sn.call("files")
@@ -2829,6 +2924,16 @@ func test_hook(args: PackedStringArray) -> void:
 		ui.touch.queue_redraw()
 		await wait(0.3)
 		await sn.call("touch")
+		ui.tbtn["B"] = false
+		ui.stick_id = -1
+		open_pause()
+		await wait(0.3)
+		await sn.call("pause")
+		close_pause()
+		ui.diag.toggle()
+		await wait(0.6)
+		await sn.call("diag")
+		print("DIAG\n", ui.diag.info_text())
 		get_tree().quit()
 		return
 	if not cmd.begins_with("shot"):

@@ -1,6 +1,19 @@
 // Secondhand 3D (c) 2026 Buggy Games YT. All rights reserved.
 shader_type spatial;
 render_mode diffuse_lambert, specular_disabled;
+// The Compatibility renderer shades colours as stored (sRGB); Mobile/Forward shade in linear and
+// hand Color/source_color inputs over already linear. These macros give the same picture on both.
+#if CURRENT_RENDERER == RENDERER_COMPATIBILITY
+#define TO_LIN(x) dec(x)
+#define FROM_LIN(x) enc(x)
+#define VCOL(x) enc(x)
+#define SKYOUT(x) (x)
+#else
+#define TO_LIN(x) (x)
+#define FROM_LIN(x) (x)
+#define VCOL(x) (x)
+#define SKYOUT(x) enc(x)
+#endif
 global uniform vec3 hemi_sky;
 global uniform vec3 hemi_ground;
 uniform sampler2D tA : source_color, filter_linear_mipmap_anisotropic, repeat_enable;
@@ -28,13 +41,13 @@ void fragment() {
 	float mac = texture(tNoise, wuv * 0.011).r;
 	float det = texture(tNoise, wuv * 0.29).r - 0.5;
 	vec3 base = mix(texture(tA, wuv * uSc.x).rgb, texture(tA, wuv * uSc.x * 0.31 + 0.37).rgb, 0.4) * cA * mix(0.8, 1.16, mac);
-	vec3 sp = texture(tSplat, (wuv - uBox.xy) / uBox.zw).rgb;
+	vec3 sp = texture(tSplat, (wuv - uBox.xy) / max(uBox.zw, vec2(1e-3))).rgb;
 	vec3 col = base;
 	col = mix(col, texture(tB, wuv * uSc.y).rgb * cB, smoothstep(0.32, 0.68, sp.r + det * 0.55));
 	col = mix(col, texture(tC, wuv * uSc.z).rgb * cC, smoothstep(0.32, 0.68, sp.g + det * 0.5));
 	col = mix(col, texture(tD, wuv * uSc.w).rgb * cD, smoothstep(0.4, 0.6, sp.b + det * 0.25));
 	ALBEDO = col;
 	ROUGHNESS = 1.0;
-	vec3 n = normalize(vWN);
-	EMISSION = enc(dec(col) * mix(hemi_ground, hemi_sky, n.y * 0.5 + 0.5));
+	vec3 n = dot(vWN, vWN) > 1e-8 ? normalize(vWN) : vec3(0.0, 1.0, 0.0);
+	EMISSION = FROM_LIN(TO_LIN(col) * mix(hemi_ground, hemi_sky, clamp(n.y * 0.5 + 0.5, 0.0, 1.0)));
 }

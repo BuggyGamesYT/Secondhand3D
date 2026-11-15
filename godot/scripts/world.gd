@@ -10,6 +10,9 @@ var mesh_cache := {}
 var mat_cache := {}
 var shader_cache := {}
 var quad: QuadMesh
+var rigid_people := false   # GLES3 on phones: no GPU skinning (it runs through transform feedback)
+var split_mm := false       # GLES3 on phones: keep every MultiMesh at <= 256 instances (PowerVR driver bug)
+var part_cache := {}
 var anim_mats := []   # materials whose shader reads TIME-independent "wind" etc. (none for now)
 
 func _init() -> void:
@@ -59,6 +62,8 @@ func mesh(gi: int) -> ArrayMesh:
 	return m
 
 # ---------------------------------------------------------------- shaders
+const SHADER_PRE := "// The Compatibility renderer shades colours as stored (sRGB); Mobile/Forward shade in linear and\n// hand Color/source_color inputs over already linear. These macros give the same picture on both.\n#if CURRENT_RENDERER == RENDERER_COMPATIBILITY\n#define TO_LIN(x) dec(x)\n#define FROM_LIN(x) enc(x)\n#define VCOL(x) enc(x)\n#define SKYOUT(x) (x)\n#else\n#define TO_LIN(x) (x)\n#define FROM_LIN(x) (x)\n#define VCOL(x) (x)\n#define SKYOUT(x) enc(x)\n#endif\n"
+
 func lit_shader(o: Dictionary) -> Shader:
 	var key := JSON.stringify(o)
 	if shader_cache.has(key):
@@ -79,14 +84,15 @@ func lit_shader(o: Dictionary) -> Shader:
 	if o.get("pull", false) or o.get("bb", false):
 		modes.append("skip_vertex_transform")
 	var c := "// Secondhand 3D (c) 2026 Buggy Games YT. All rights reserved.\nshader_type spatial;\nrender_mode " + ", ".join(modes) + ";\n"
+	c += "vec3 dec(vec3 x) { return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878); }\n"
+	c += "vec3 enc(vec3 x) { return max(vec3(1.055) * pow(max(x, vec3(0.0)), vec3(0.416666667)) - vec3(0.055), vec3(0.0)); }\n"
+	c += SHADER_PRE
 	c += "global uniform vec3 hemi_sky;\nglobal uniform vec3 hemi_ground;\n"
 	c += "uniform vec4 albedo : source_color = vec4(1.0);\nuniform float opacity = 1.0;\n"
 	if o.get("tex", false):
 		c += "uniform sampler2D tex : source_color, filter_linear_mipmap_anisotropic, %s;\n" % ("repeat_disable" if o.get("clamp", false) else "repeat_enable")
 	c += "uniform vec3 emis : source_color = vec3(0.0);\nuniform float rough = 1.0;\nuniform float spec = 0.0;\nvarying vec3 vWN;\n"
-	# the Compatibility renderer treats ALBEDO/EMISSION as sRGB: keep everything in that space
-	c += "vec3 dec(vec3 x) { return x * (x * (x * 0.305306011 + 0.682171111) + 0.012522878); }\n"
-	c += "vec3 enc(vec3 x) { return max(vec3(1.055) * pow(max(x, vec3(0.0)), vec3(0.416666667)) - vec3(0.055), vec3(0.0)); }\n"
+	# the Compatibility renderer treats ALBEDO/EMISSION as sRGB: keep everything in that space (the TO_LIN/FROM_LIN macros make Mobile shade in linear instead)
 	c += "void vertex() {\n"
 	var wind := int(o.get("wind", 0))
 	if wind == 1:
@@ -103,13 +109,13 @@ func lit_shader(o: Dictionary) -> Shader:
 	if o.get("tex", false):
 		c += "\tc *= texture(tex, UV);\n"
 	if o.get("vc", false):
-		c += "\tc.rgb *= enc(COLOR.rgb);\n"
+		c += "\tc.rgb *= VCOL(COLOR.rgb);\n"
 	c += "\tALBEDO = c.rgb;\n"
 	if not o.get("unshaded", false):
-		c += "\tROUGHNESS = rough;\n\tSPECULAR = spec;\n\tvec3 n = normalize(vWN);\n\tif (!FRONT_FACING) n = -n;\n"
-		c += "\tEMISSION = enc(dec(c.rgb) * mix(hemi_ground, hemi_sky, n.y * 0.5 + 0.5) + dec(emis));\n"
+		c += "\tROUGHNESS = rough;\n\tSPECULAR = spec;\n\tvec3 n = dot(vWN, vWN) > 1e-8 ? normalize(vWN) : vec3(0.0, 1.0, 0.0);\n\tif (!FRONT_FACING) n = -n;\n"
+		c += "\tEMISSION = FROM_LIN(TO_LIN(c.rgb) * mix(hemi_ground, hemi_sky, clamp(n.y * 0.5 + 0.5, 0.0, 1.0)) + TO_LIN(emis));\n"
 	if o.get("alpha", false):
-		c += "\tALPHA = c.a * opacity;\n"
+		c += "\tALPHA = clamp(c.a * opacity, 0.0, 1.0);\n"
 	c += "}\n"
 	var sh := Shader.new()
 	sh.code = c
@@ -243,16 +249,22 @@ func build(n: Dictionary, tags: Dictionary, extra: Dictionary = {}) -> Node3D:
 		si.extra_cull_margin = 2.0
 		node = si
 	elif t == "i":
-		var mmi := MultiMeshInstance3D.new()
-		var mm := MultiMesh.new()
-		mm.transform_format = MultiMesh.TRANSFORM_3D
-		mm.use_colors = int(n.get("ucol", 0)) == 1
-		mm.mesh = mesh(int(n.g))
-		mm.instance_count = int(n.cnt)
-		mm.buffer = fa(n.buf).to_float32_array()
-		mmi.multimesh = mm
-		mmi.material_override = material(int(n.m))
-		mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON if int(n.get("cs", 0)) == 1 else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		var cnt := int(n.cnt)
+		var mmi: GeometryInstance3D
+		if split_mm and cnt > 256:
+			mmi = _split_multimesh(n, cnt)
+		else:
+			var mmi1 := MultiMeshInstance3D.new()
+			var mm := MultiMesh.new()
+			mm.transform_format = MultiMesh.TRANSFORM_3D
+			mm.use_colors = int(n.get("ucol", 0)) == 1
+			mm.mesh = mesh(int(n.g))
+			mm.instance_count = cnt
+			mm.buffer = fa(n.buf).to_float32_array()
+			mmi1.multimesh = mm
+			mmi1.material_override = material(int(n.m))
+			mmi1.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON if int(n.get("cs", 0)) == 1 else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			mmi = mmi1
 		node = mmi
 		if n.has("near"):
 			if not extra.has("near"):
@@ -287,6 +299,82 @@ func build(n: Dictionary, tags: Dictionary, extra: Dictionary = {}) -> Node3D:
 		for ch in n.c:
 			node.add_child(build(ch, tags, extra))
 	return node
+
+# a big MultiMesh as several <=256-instance ones under one empty parent (callers only toggle .visible)
+func _split_multimesh(n: Dictionary, cnt: int) -> GeometryInstance3D:
+	var holder := MultiMeshInstance3D.new()   # empty holder (no multimesh) keeps the node type
+	var buf := fa(n.buf).to_float32_array()
+	var ucol := int(n.get("ucol", 0)) == 1
+	var stride := 12 + (4 if ucol else 0)
+	var mat := material(int(n.m))
+	var cs := GeometryInstance3D.SHADOW_CASTING_SETTING_ON if int(n.get("cs", 0)) == 1 else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var i := 0
+	while i < cnt:
+		var k := mini(256, cnt - i)
+		var mm := MultiMesh.new()
+		mm.transform_format = MultiMesh.TRANSFORM_3D
+		mm.use_colors = ucol
+		mm.mesh = mesh(int(n.g))
+		mm.instance_count = k
+		mm.buffer = buf.slice(i * stride, (i + k) * stride)
+		var part := MultiMeshInstance3D.new()
+		part.multimesh = mm
+		part.material_override = mat
+		part.cast_shadow = cs
+		holder.add_child(part)
+		i += k
+	holder.cast_shadow = cs
+	return holder
+
+# a skinned person mesh (one bone per vertex, weight 1) cut into rigid pieces, one per bone,
+# with vertices moved into that bone's rest space: looks identical, needs no GPU skinning
+func person_parts(geo: int, bone_rest: Array) -> Array:
+	if part_cache.has(geo):
+		return part_cache[geo]
+	var g: Dictionary = M.geos[geo]
+	var a: Dictionary = g.a
+	var pos: PackedVector3Array = fa(a.position).to_vector3_array()
+	var nor: PackedVector3Array = fa(a.normal).to_vector3_array() if a.has("normal") else PackedVector3Array()
+	var uv: PackedVector2Array = fa(a.uv).to_vector2_array() if a.has("uv") else PackedVector2Array()
+	var col: PackedColorArray = fa(a.color).to_color_array() if a.has("color") else PackedColorArray()
+	var si: PackedInt32Array = fa(a.skinIndex).to_int32_array()
+	var idx: PackedInt32Array = fa(g.idx).to_int32_array() if g.has("idx") else PackedInt32Array()
+	if idx.is_empty():
+		idx.resize(pos.size())
+		for i in pos.size():
+			idx[i] = i
+	var per := {}   # bone -> [remap dict, positions, normals, uvs, colors, indices]
+	for t in range(0, idx.size(), 3):
+		var b := si[idx[t] * 4]
+		if not per.has(b):
+			per[b] = [{}, PackedVector3Array(), PackedVector3Array(), PackedVector2Array(), PackedColorArray(), PackedInt32Array()]
+		var P: Array = per[b]
+		var off: Vector3 = bone_rest[b] if b < bone_rest.size() else Vector3.ZERO
+		for j in 3:
+			var v := idx[t + j]
+			var rm: Dictionary = P[0]
+			if not rm.has(v):
+				rm[v] = P[1].size()
+				P[1].append(pos[v] - off)
+				if not nor.is_empty(): P[2].append(nor[v])
+				if not uv.is_empty(): P[3].append(uv[v])
+				if not col.is_empty(): P[4].append(col[v])
+			P[5].append(rm[v])
+	var out := []
+	for b in per:
+		var P: Array = per[b]
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = P[1]
+		if not nor.is_empty(): arr[Mesh.ARRAY_NORMAL] = P[2]
+		if not uv.is_empty(): arr[Mesh.ARRAY_TEX_UV] = P[3]
+		if not col.is_empty(): arr[Mesh.ARRAY_COLOR] = P[4]
+		arr[Mesh.ARRAY_INDEX] = P[5]
+		var m := ArrayMesh.new()
+		m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		out.append([b, m])
+	part_cache[geo] = out
+	return out
 
 func prefab(name: String) -> Dictionary:
 	var tags := {}

@@ -95,41 +95,79 @@ jobs:
           fi
           echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$PWD/build/release.keystore" >> "$GITHUB_ENV"
 
-      - name: Import project
+      - name: Import project (Compatibility / GLES3)
         working-directory: godot
         run: |
           ~/godot-cache/godot --headless --import 2>&1 | tail -n 20 || true
           ls .godot | head
 
-      - name: Export signed release APK
+      - name: Export GL (Compatibility) APK
         working-directory: godot
         run: |
           set -e
-          ~/godot-cache/godot --headless --export-release "Android" ../build/Secondhand3D.apk 2>&1 | tee ../build/export.log
-          test -s ../build/Secondhand3D.apk || { echo "::error::Export produced no APK"; exit 1; }
+          ~/godot-cache/godot --headless --export-release "Android" ../build/Secondhand3D-gl.apk 2>&1 | tee ../build/export-gl.log
+          test -s ../build/Secondhand3D-gl.apk || { echo "::error::GL export produced no APK"; exit 1; }
+          if grep -q "SHADER ERROR\|SCRIPT ERROR\|Parse Error" ../build/export-gl.log; then echo "::error::errors in GL export"; exit 1; fi
 
-      - name: Verify and name the APK
+      - name: Switch project to the Mobile (Vulkan) renderer
+        working-directory: godot
+        run: |
+          set -e
+          sed -i 's/^renderer\/rendering_method=.*/renderer\/rendering_method="mobile"/; s/^renderer\/rendering_method.mobile=.*/renderer\/rendering_method.mobile="mobile"/' project.godot
+          sed -i 's/"GL Compatibility")/"Mobile")/' project.godot
+          # keep the SPIR-V shader cache on Vulkan (pipeline cache stays off: it crashes the Pixel 10 PowerVR driver)
+          sed -i '/^shader_compiler\/shader_cache\/enabled.android=/d' project.godot
+          grep -n "rendering_method\|config/features\|cache" project.godot
+
+      - name: Import project (Mobile / Vulkan)
+        working-directory: godot
+        run: |
+          ~/godot-cache/godot --headless --import 2>&1 | tail -n 20 || true
+
+      - name: Export VK (Mobile) APK
+        working-directory: godot
+        run: |
+          set -e
+          ~/godot-cache/godot --headless --export-release "Android" ../build/Secondhand3D-vk.apk 2>&1 | tee ../build/export-vk.log
+          test -s ../build/Secondhand3D-vk.apk || { echo "::error::VK export produced no APK"; exit 1; }
+          if grep -q "SHADER ERROR\|SCRIPT ERROR\|Parse Error" ../build/export-vk.log; then echo "::error::errors in VK export"; exit 1; fi
+          git checkout project.godot
+
+      - name: Verify and name the APKs
         run: |
           set -e
           rm -f build/release.keystore
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
-          "$BT/apksigner" verify --print-certs build/Secondhand3D.apk | head -n 5
-          "$BT/aapt2" dump badging build/Secondhand3D.apk | head -n 3
+          for v in gl vk; do
+            echo "== $v"
+            "$BT/apksigner" verify --print-certs "build/Secondhand3D-$v.apk" | head -n 5
+            "$BT/aapt2" dump badging "build/Secondhand3D-$v.apk" | head -n 3
+            "$BT/aapt2" dump badging "build/Secondhand3D-$v.apk" | grep -i "vulkan\|opengl\|orientation" || true
+          done
+          # the default download: GL (Compatibility) is the safer pick on the Pixel 10's PowerVR GPU
+          cp build/Secondhand3D-gl.apk build/Secondhand3D.apk
           VER=$(grep -o '^version/name="[^"]*"' godot/export_presets.cfg | cut -d'"' -f2)
-          cp build/Secondhand3D.apk "build/Secondhand3D-v$VER.apk"
+          cp build/Secondhand3D-gl.apk "build/Secondhand3D-v$VER-gl.apk"
+          cp build/Secondhand3D-vk.apk "build/Secondhand3D-v$VER-vk.apk"
           echo "VER=$VER" >> "$GITHUB_ENV"
           ls -la build
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Secondhand3D-v${{ env.VER }}
-          path: build/Secondhand3D-v${{ env.VER }}.apk
+          name: Secondhand3D-gl.apk
+          path: build/Secondhand3D-gl.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Secondhand3D-vk.apk
+          path: build/Secondhand3D-vk.apk
 
       - name: Publish release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/Secondhand3D-v${{ env.VER }}.apk
             build/Secondhand3D.apk
+            build/Secondhand3D-gl.apk
+            build/Secondhand3D-vk.apk
           generate_release_notes: true

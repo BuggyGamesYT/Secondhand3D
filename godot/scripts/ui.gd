@@ -56,6 +56,10 @@ var look_last := Vector2.ZERO
 var look_acc := Vector2.ZERO
 var btn_ids := {}
 var unit := 1.0
+const DiagScript := preload("res://scripts/diag.gd")
+var diag
+var safe_files_btn: Button
+var touches := {}
 
 func _ready() -> void:
 	layer = 5
@@ -117,6 +121,10 @@ func _ready() -> void:
 	root.add_child(touch)
 	build_map()
 	build_panels()
+	diag = DiagScript.new()
+	diag.ui = self
+	diag.game = game
+	root.add_child(diag)
 	show_panel("cart")
 
 func typing() -> bool:
@@ -143,28 +151,70 @@ func sbox(bg: Color, border: Color = Color(0, 0, 0, 0), bw := 0, radius := 0, pa
 	return s
 
 # ---------------------------------------------------------------- layout
+# The UI is laid out in a virtual canvas whose short side is about 420 units on phones
+# (so it looks the same at any phone resolution / DPI setting), recomputed on every resize.
+var last_ws := Vector2i.ZERO
+var last_sa := Rect2i()
+var force_mobile := false   # test hook: lay out like a phone on desktop
+
+func is_phone() -> bool:
+	return OS.has_feature("mobile") or force_mobile
+
+func win_size() -> Vector2:
+	var w := get_window()
+	var ws := Vector2(w.size) if w else Vector2.ZERO
+	if ws.x < 2.0 or ws.y < 2.0:
+		ws = Vector2(DisplayServer.window_get_size())
+	if ws.x < 2.0 or ws.y < 2.0:
+		ws = Vector2(1280, 720)
+	return ws
+
 func on_resize() -> void:
 	var win := get_window()
-	var ws := Vector2(DisplayServer.window_get_size())
+	var ws := win_size()
 	var f := 1.0
-	if OS.has_feature("mobile"):
-		f = clampf(DisplayServer.screen_get_dpi() / 160.0, 1.0, 4.0)
+	if is_phone():
+		# landscape: ~420 tall x >=800 wide; portrait (if the OS ever forces it): ~800 tall
+		f = clampf(minf(maxf(ws.x, ws.y) / 800.0, minf(ws.x, ws.y) / 420.0), 1.0, 6.0)
 	else:
 		f = clampf(minf(ws.x, ws.y) / 640.0, 1.0, 3.0)
 		if OS.get_cmdline_user_args().has("scale2"):
 			f = 2.0
 	unit = f
+	var cs := Vector2i(maxi(320, int(ws.x / f)), maxi(240, int(ws.y / f)))
+	last_ws = Vector2i(ws)
+	last_sa = DisplayServer.get_display_safe_area()
 	win.content_scale_mode = Window.CONTENT_SCALE_MODE_CANVAS_ITEMS
 	win.content_scale_aspect = Window.CONTENT_SCALE_ASPECT_EXPAND
-	win.content_scale_size = Vector2i(maxi(1, int(ws.x / f)), maxi(1, int(ws.y / f)))
+	if win.content_scale_size != cs:
+		win.content_scale_size = cs
+	relayout()
 	call_deferred("relayout")
 
+# called every frame: catches rotations / immersive-mode changes the signal can miss
+func watch_size() -> void:
+	var ws := Vector2i(win_size())
+	if ws != last_ws or (is_phone() and DisplayServer.get_display_safe_area() != last_sa):
+		if game and game.has_method("on_resize"):
+			game.on_resize()
+		else:
+			on_resize()
+
+var fake_cut := 0.0   # test hook: pretend a camera cutout on the left
 func safe_insets() -> Array:
-	var sa := DisplayServer.get_display_safe_area()
-	var ws := Vector2(DisplayServer.window_get_size())
-	if sa.size.x <= 0 or not OS.has_feature("mobile"):
+	if fake_cut > 0.0:
+		return [fake_cut / unit, 0.0, 0.0, 0.0]
+	if not OS.has_feature("mobile"):
 		return [0.0, 0.0, 0.0, 0.0]
-	return [sa.position.x / unit, sa.position.y / unit, maxf(0.0, ws.x - sa.end.x) / unit, maxf(0.0, ws.y - sa.end.y) / unit]
+	var sa := DisplayServer.get_display_safe_area()
+	var ws := win_size()
+	if sa.size.x <= 0 or sa.size.y <= 0 or sa.size.x > ws.x + 1 or sa.size.y > ws.y + 1:
+		return [0.0, 0.0, 0.0, 0.0]
+	var k := unit
+	var r := [maxf(0.0, sa.position.x) / k, maxf(0.0, sa.position.y) / k, maxf(0.0, ws.x - sa.end.x) / k, maxf(0.0, ws.y - sa.end.y) / k]
+	for i in 4:
+		r[i] = minf(float(r[i]), 80.0)   # never let a bogus safe area eat the screen
+	return r
 
 func vsize() -> Vector2:
 	return root.get_viewport_rect().size
@@ -183,9 +233,13 @@ func relayout() -> void:
 	prompt_panel.position = Vector2((s.x - prompt_panel.size.x) / 2.0, s.y * 0.7 - prompt_panel.size.y)
 	var ms := minf(s.x * 0.86, s.y * 0.7)
 	map_ctl.custom_minimum_size = Vector2(ms, ms)
+	relayout_panels()
+	if diag:
+		diag.relayout(s, ins)
 	touch.queue_redraw()
 
 func _process(dt: float) -> void:
+	watch_size()
 	if toast_t > 0.0:
 		toast_t -= dt
 		if toast_t <= 0.0:
@@ -288,6 +342,8 @@ func fade(on: bool) -> void:
 
 func set_post(drain: float, glitch: float, tint: Vector3, t: float, blink: bool) -> void:
 	var active := drain > 0.002 or glitch > 0.0 or tint.distance_to(Vector3.ONE) > 0.003
+	if game and game.META.get("safe", false):
+		active = false   # safe graphics: no screen-texture post effect
 	post_rect.visible = active
 	if active:
 		post_mat.set_shader_parameter("drain", drain)
@@ -401,6 +457,18 @@ func hit_btn(p: Vector2) -> String:
 	return ""
 
 func _input(e: InputEvent) -> void:
+	if e is InputEventScreenTouch:
+		# three-finger tap anywhere toggles the diagnostics overlay
+		if e.pressed:
+			if e.index == 0:
+				touches.clear()
+			touches[e.index] = true
+			if touches.size() == 3:
+				diag.toggle()
+		else:
+			touches.erase(e.index)
+	if e is InputEventKey and e.pressed and not e.echo and e.keycode == KEY_F3:
+		diag.toggle()
 	if e is InputEventScreenTouch:
 		if not touch_mode:
 			touch_mode = true
@@ -546,10 +614,12 @@ func btn(t: String, alt: bool, cb: Callable) -> Button:
 	b.pressed.connect(cb)
 	return b
 
-func row(children: Array) -> HBoxContainer:
-	var h := HBoxContainer.new()
-	h.alignment = BoxContainer.ALIGNMENT_CENTER
-	h.add_theme_constant_override("separation", 10)
+func row(children: Array) -> HFlowContainer:
+	# wraps onto a second line when the screen is narrow instead of pushing past the edge
+	var h := HFlowContainer.new()
+	h.alignment = FlowContainer.ALIGNMENT_CENTER
+	h.add_theme_constant_override("h_separation", 10)
+	h.add_theme_constant_override("v_separation", 8)
 	for c in children:
 		h.add_child(c)
 	return h
@@ -565,6 +635,7 @@ func slot_btn(cb: Callable) -> Button:
 	var b := Button.new()
 	b.alignment = HORIZONTAL_ALIGNMENT_LEFT
 	b.custom_minimum_size = Vector2(0, 58)
+	b.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	b.add_theme_stylebox_override("normal", sbox(Color("#111111"), Color("#333333"), 1, 0, 12))
 	b.add_theme_stylebox_override("hover", sbox(Color("#151515"), Color("#555555"), 1, 0, 12))
 	b.add_theme_stylebox_override("pressed", sbox(Color("#111111"), Color("#1f9e8f"), 1, 0, 12))
@@ -597,6 +668,10 @@ func build_panels() -> void:
 	files_msg_lbl.custom_minimum_size = Vector2(200, 20)
 	vb.add_child(files_msg_lbl)
 	vb.add_child(row([btn("Controls", true, _help_from_files), btn("Erase cartridge", true, func() -> void: confirm_box.visible = true)]))
+	safe_files_btn = btn("Safe graphics: off", true, func() -> void:
+		game.toggle_safe()
+		sync_safe())
+	vb.add_child(row([safe_files_btn]))
 	confirm_box = VBoxContainer.new()
 	confirm_box.add_child(para("Erase every file on the cartridge?"))
 	confirm_box.add_child(row([btn("Erase", false, func() -> void: game.on_erase()), btn("Keep", true, func() -> void: confirm_box.visible = false)]))
@@ -631,11 +706,12 @@ func build_panels() -> void:
 	pbtn.sens = btn("Camera speed: normal", true, func() -> void: game.on_pause_button("sens"))
 	pbtn.inv = btn("Invert camera: off", true, func() -> void: game.on_pause_button("inv"))
 	pbtn.gfx = btn("Graphics: auto", true, func() -> void: game.on_pause_button("gfx"))
+	pbtn.safe = btn("Safe graphics: off", true, func() -> void: game.on_pause_button("safe"))
 	pbtn.help = btn("Controls", true, _help_from_pause)
 	pbtn.quit = btn("Save & quit", true, func() -> void: game.on_pause_button("quit"))
 	vb.add_child(row([pbtn.resume, pbtn.sound]))
 	vb.add_child(row([pbtn.sens, pbtn.inv]))
-	vb.add_child(row([pbtn.gfx]))
+	vb.add_child(row([pbtn.gfx, pbtn.safe]))
 	vb.add_child(row([pbtn.help, pbtn.quit]))
 	# help
 	vb = panel_box("help")
@@ -685,10 +761,17 @@ func _upper_name(t: String) -> void:
 
 func relayout_panels() -> void:
 	var s := vsize()
+	var ins := safe_insets()
 	for id in panels:
 		var vb: VBoxContainer = panels[id].vb
-		vb.custom_minimum_size.x = minf(400.0, s.x - 32.0 - 40.0)
-		panels[id].cc.custom_minimum_size = s
+		vb.custom_minimum_size.x = clampf(s.x - ins[0] - ins[2] - 32.0 - 40.0, 160.0, 400.0)
+		# keep the panel inside the safe area (camera cutout / rounded corners)
+		var sc: ScrollContainer = panels[id].sc
+		sc.offset_left = ins[0]
+		sc.offset_top = ins[1]
+		sc.offset_right = -ins[2]
+		sc.offset_bottom = -ins[3]
+		panels[id].cc.custom_minimum_size = Vector2.ZERO
 
 func submit_name() -> void:
 	name_in.release_focus()
@@ -732,6 +815,14 @@ func sync_pause() -> void:
 	pbtn.sens.text = "Camera speed: " + ("slow" if s < 0.8 else ("fast" if s > 1.2 else "normal"))
 	pbtn.inv.text = "Invert camera: " + ("on" if M.inv else "off")
 	pbtn.gfx.text = "Graphics: " + ("battery saver" if M.get("gfx", "auto") == "low" else "auto")
+	pbtn.safe.text = "Safe graphics: " + ("on" if M.get("safe", false) else "off")
+
+func sync_safe() -> void:
+	var on: bool = game.META.get("safe", false)
+	if safe_files_btn:
+		safe_files_btn.text = "Safe graphics: " + ("on" if on else "off")
+	if pbtn.has("safe"):
+		pbtn.safe.text = "Safe graphics: " + ("on" if on else "off")
 
 func end_stats(t: String) -> void:
 	end_stats_lbl.text = t

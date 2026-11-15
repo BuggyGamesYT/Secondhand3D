@@ -70,8 +70,6 @@ func setup(world: World, palname: String, sc := 1.0, opacity := -1.0) -> Person:
 	thL = bones.thL; knL = bones.knL; ftL = bones.ftL; thR = bones.thR; knR = bones.knR; ftR = bones.ftR
 	shL.yxz = true
 	shR.yxz = true
-	mi = MeshInstance3D.new()
-	mi.mesh = w.mesh(int(rec.geo))
 	var bm: Material = w.material(int(rec.mat))
 	if opacity > 0.0:
 		var sm := ShaderMaterial.new()
@@ -79,11 +77,30 @@ func setup(world: World, palname: String, sc := 1.0, opacity := -1.0) -> Person:
 		sm.set_shader_parameter("tex", w.tex("atlas"))
 		sm.set_shader_parameter("opacity", opacity)
 		bm = sm
-	mi.material_override = bm
-	skel.add_child(mi)
-	mi.skeleton = NodePath("..")
-	mi.skin = skel.create_skin_from_rest_transforms()
-	mi.extra_cull_margin = 1.5
+	if w.rigid_people:
+		# one rigid piece per bone, carried by BoneAttachment3D: no GPU skinning needed
+		var rest := []
+		for i in skel.get_bone_count():
+			rest.append(skel.get_bone_global_rest(i).origin)
+		for pr in w.person_parts(int(rec.geo), rest):
+			var at := BoneAttachment3D.new()
+			skel.add_child(at)
+			at.bone_idx = int(pr[0])
+			var part := MeshInstance3D.new()
+			part.mesh = pr[1]
+			part.material_override = bm
+			part.extra_cull_margin = 1.0
+			at.add_child(part)
+			if mi == null:
+				mi = part
+	else:
+		mi = MeshInstance3D.new()
+		mi.mesh = w.mesh(int(rec.geo))
+		mi.material_override = bm
+		skel.add_child(mi)
+		mi.skeleton = NodePath("..")
+		mi.skin = skel.create_skin_from_rest_transforms()
+		mi.extra_cull_margin = 1.5
 	var ha := attach("head")
 	eyes = MeshInstance3D.new()
 	eyes.mesh = w.mesh(int(rec.eyesGeo))
