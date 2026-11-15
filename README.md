@@ -6,7 +6,7 @@ Walk around Millbrook, clear the Hollow, and bring the bell pieces back to the d
 
 - Play in your browser: https://buggygamesyt.github.io/secondhand3d/
 - Android: grab `Secondhand3D.apk` from the latest release. From v1.1 the Android app is a native build (no browser inside), so it runs on phones whose browser 3D crashes.
-  - From v1.2 there are two builds of the same app (they install over each other): `Secondhand3D-gl.apk` (OpenGL ES, the default `Secondhand3D.apk`) and `Secondhand3D-vk.apk` (Vulkan). If one shows a black screen on your phone, try the other.
+  - From v1.1 there are two builds of the same app (they install over each other): `Secondhand3D-gl.apk` (OpenGL ES, the default `Secondhand3D.apk`) and `Secondhand3D-vk.apk` (Vulkan). If one shows a black screen on your phone, try the other.
   - Black screen or glitches? Turn on **Safe graphics** on the file screen or in the pause menu. Hold SELECT for a second (or tap with three fingers) to open the info overlay, then tap **Copy log** and paste it in a bug report.
 
 Controls: WASD / arrows walk, mouse or Q/E turn the camera, J/Z = A (talk, open; hold to run), K/X/Space = B (sword; hold then let go to spin), Enter/Esc = START (pause), Tab/M = SELECT (map). Phone: left thumb moves, drag on the right to look, A and B buttons, START and SELECT at the top. Controllers work too.
